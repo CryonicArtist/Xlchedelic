@@ -80,8 +80,8 @@ def firm_decision_and_learning_step(raw_market_window, portfolio_value, drawdown
     # --- STEP 2: THE BOSS WATCHES AND PREDICTS ---
     portfolio_state = torch.tensor([portfolio_value, drawdown], dtype=torch.float32)
     
-    # Boss generates its expected value (The Grade)
-    expected_reward = boss(translated_data, signal, portfolio_state)
+    # .detach() severs the graph so the Boss and Employees don't trip over each other
+    expected_reward = boss(translated_data.detach(), signal.detach(), portfolio_state)
     
     # --- STEP 3: THE BOSS TEACHES THE EMPLOYEES ---
     # Convert actual reward from the market into a tensor
@@ -120,9 +120,9 @@ class SPYTradingDataset(Dataset):
         
         # We need raw prices to calculate actual dollar profit in the loop
         # Assuming 'close' is the 4th column (index 3) based on your image
-        self.raw_prices = features_df.select("# close").to_numpy(dtype=np.float32).flatten()
+        self.raw_prices = features_df.select("close").to_numpy().astype(np.float32).flatten()
         
-        raw_data = features_df.to_numpy(dtype=np.float32)
+        raw_data = features_df.to_numpy().astype(np.float32)
         
         # Normalize the data for the neural networks
         mean = np.mean(raw_data, axis=0)
@@ -152,45 +152,47 @@ class SPYTradingDataset(Dataset):
 
 def train_firm(epochs=5, initial_capital=100000.0, fee_percent=0.0001):
     print("Loading Data...")
-    # Make sure this matches your file name exactly
+    # Using the correctly spelled file name!
     dataset = SPYTradingDataset("spy_1min_2008_2021_cleaned.parquet") 
-    
-    # Batch size of 1 means we step through minute-by-minute
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
     
     for epoch in range(epochs):
         print(f"\n--- Starting Epoch {epoch + 1} ---")
         
-        # Reset the firm's portfolio at the start of each timeline run
         portfolio_value = initial_capital
         peak_portfolio_value = initial_capital
         is_invested = 0  # 0 = Cash, 1 = Holding SPY
         
         for step, (window, current_price, next_price) in enumerate(dataloader):
-            # PyTorch dataloader adds an extra dimension, we strip it out
             window = window.squeeze(0)
             current_price = current_price.item()
             next_price = next_price.item()
             
-            # 1. Calculate Drawdown (How far are we down from our all-time high?)
+            # 1. Calculate Drawdown
             if portfolio_value > peak_portfolio_value:
                 peak_portfolio_value = portfolio_value
             drawdown = (peak_portfolio_value - portfolio_value) / peak_portfolio_value
             
-            # 2. Market Math: What would the actual reward be if we bought/held/sold?
+            # --------------------------------------------------
+            # 2. FIRM THINKS (Forward Pass)
+            # --------------------------------------------------
+            portfolio_state = torch.tensor([portfolio_value, drawdown], dtype=torch.float32)
+            position_tensor = torch.tensor([is_invested], dtype=torch.float32)
+            
+            translated_data = translator(window)
+            signal = evaluator(translated_data)
+            action_probs = executor(signal, position_tensor)
+            action = torch.argmax(action_probs).item()
+            
+            # The Boss makes its prediction (using .detach() so the graph doesn't break!)
+            expected_reward = boss(translated_data.detach(), signal.detach(), portfolio_state)
+            
+            # --------------------------------------------------
+            # 3. ARENA EXECUTES (Calculate Actual Reward)
+            # --------------------------------------------------
             price_change = (next_price - current_price) / current_price
             actual_reward = 0.0
             
-            # 3. Ask the Firm to make a decision and learn from it
-            action, action_probs = firm_decision_and_learning_step(
-                raw_market_window=window,
-                portfolio_value=portfolio_value,
-                drawdown=drawdown,
-                is_invested=is_invested,
-                actual_reward=0.0 # Placeholder, we calculate it dynamically below based on action
-            )
-            
-            # 4. Execute the Firm's decision in our imaginary Arena
             if is_invested == 0:
                 if action == 0:  # BUY
                     actual_reward = price_change - fee_percent
@@ -201,15 +203,31 @@ def train_firm(epochs=5, initial_capital=100000.0, fee_percent=0.0001):
                     actual_reward = -fee_percent
                     portfolio_value *= (1 + actual_reward)
                     is_invested = 0
-                else:  # HOLD (or trying to buy while already holding)
+                else:  # HOLD 
                     actual_reward = price_change
                     portfolio_value *= (1 + actual_reward)
+                    
+            # --------------------------------------------------
+            # 4. FIRM LEARNS (Backward Pass)
+            # --------------------------------------------------
+            reward_tensor = torch.tensor([actual_reward], dtype=torch.float32)
             
-            # Note: The Boss actually needs the calculated `actual_reward` to teach the employees.
-            # In a true loop, we would pass the actual reward *after* execution to the learning step.
-            # For simplicity in this skeleton, the firm is learning continuously step-by-step.
-
-            # 5. Print an update every 10,000 minutes to watch them learn
+            # Boss calculates how wrong its prediction was
+            advantage = reward_tensor - expected_reward.detach()
+            
+            # Employees get rewired based on the advantage
+            employee_loss = -torch.log(action_probs[action] + 1e-8) * advantage
+            employee_optimizer.zero_grad()
+            employee_loss.backward()
+            employee_optimizer.step()
+            
+            # Boss gets rewired based on how far off its prediction was from reality
+            boss_loss = nn.MSELoss()(expected_reward, reward_tensor)
+            boss_optimizer.zero_grad()
+            boss_loss.backward()
+            boss_optimizer.step()
+            
+            # Print an update every 10,000 minutes
             if step % 10000 == 0:
                 print(f"Step {step}: Portfolio = ${portfolio_value:.2f} | Drawdown = {drawdown*100:.2f}% | Invested: {is_invested}")
 
