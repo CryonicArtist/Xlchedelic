@@ -4,6 +4,11 @@ import torch.optim as optim
 import polars as pl
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
+import random
+
+# Check if GPU is available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 class TranslationBot(nn.Module):
     def __init__(self):
@@ -21,7 +26,7 @@ class EvaluationBot(nn.Module):
         # Takes 16 translated features
         self.brain = nn.Sequential(
             nn.Linear(16, 32), nn.ReLU(),
-            nn.Linear(32, 3), nn.Tanh() 
+            nn.Linear(32, 3), nn.Tanh()
         )
     def forward(self, translated_data):
         return self.brain(translated_data)
@@ -40,7 +45,7 @@ class ExecutionBot(nn.Module):
 class BossBot(nn.Module):
     def __init__(self):
         super().__init__()
-        # The Boss sees EVERYTHING. 
+        # The Boss sees EVERYTHING.
         # 16 Translated Market features + 3 Evaluator Signals + 2 Portfolio stats = 21 inputs
         self.brain = nn.Sequential(
             nn.Linear(21, 32),
@@ -51,13 +56,13 @@ class BossBot(nn.Module):
         boss_vision = torch.cat((translated_data, evaluator_signal, portfolio_state))
         return self.brain(boss_vision)
 
-# Initialize the bots
-translator = TranslationBot()
-evaluator = EvaluationBot()
-executor = ExecutionBot()
-boss = BossBot()
+# Initialize the bots and send them to the GPU
+translator = TranslationBot().to(device)
+evaluator = EvaluationBot().to(device)
+executor = ExecutionBot().to(device)
+boss = BossBot().to(device)
 
-# We now need TWO optimizers. One for the Employees to learn from the Boss, 
+# We now need TWO optimizers. One for the Employees to learn from the Boss,
 # and one for the Boss to evolve its own predictive accuracy.
 employee_parameters = list(translator.parameters()) + list(evaluator.parameters()) + list(executor.parameters())
 employee_optimizer = optim.Adam(employee_parameters, lr=0.001)
@@ -68,45 +73,45 @@ boss_optimizer = optim.Adam(boss.parameters(), lr=0.002) # Boss learns slightly 
 # ==========================================
 
 def firm_decision_and_learning_step(raw_market_window, portfolio_value, drawdown, is_invested, actual_reward):
-    
+
     # --- STEP 1: THE EMPLOYEES WORK ---
     translated_data = translator(raw_market_window)
     signal = evaluator(translated_data)
-    
+
     position_tensor = torch.tensor([is_invested], dtype=torch.float32)
     action_probs = executor(signal, position_tensor)
     action = torch.argmax(action_probs).item()
-    
+
     # --- STEP 2: THE BOSS WATCHES AND PREDICTS ---
     portfolio_state = torch.tensor([portfolio_value, drawdown], dtype=torch.float32)
-    
+
     # .detach() severs the graph so the Boss and Employees don't trip over each other
     expected_reward = boss(translated_data.detach(), signal.detach(), portfolio_state)
-    
+
     # --- STEP 3: THE BOSS TEACHES THE EMPLOYEES ---
     # Convert actual reward from the market into a tensor
     reward_tensor = torch.tensor([actual_reward], dtype=torch.float32)
-    
+
     # Calculate Advantage: How much better/worse did the firm do vs the Boss's prediction?
     # .detach() stops the employees from accidentally rewiring the Boss's brain during their update
-    advantage = reward_tensor - expected_reward.detach() 
-    
+    advantage = reward_tensor - expected_reward.detach()
+
     # Employees rewire their brains based on the Boss's Advantage signal
     employee_loss = -torch.log(action_probs[action] + 1e-8) * advantage
-    
+
     employee_optimizer.zero_grad()
     employee_loss.backward()
     employee_optimizer.step()
-    
+
     # --- STEP 4: THE BOSS EVOLVES ---
     # The Boss rewires its own brain to make its predictions closer to reality next time
     # This uses Mean Squared Error (MSE)
     boss_loss = nn.MSELoss()(expected_reward, reward_tensor)
-    
+
     boss_optimizer.zero_grad()
     boss_loss.backward()
     boss_optimizer.step()
-    
+
     return action, action_probs
 
 # ==========================================
@@ -115,34 +120,52 @@ def firm_decision_and_learning_step(raw_market_window, portfolio_value, drawdown
 class SPYTradingDataset(Dataset):
     def __init__(self, file_path, window_size=14):
         self.window_size = window_size
+        # Load the data
         df = pl.read_parquet(file_path)
+
+        # --- NEW DATE FILTER ---
+        print("Filtering data for 2010-2015...")
+
+        # Tell Polars exactly how to read your date string: "%Y-%m-%d %H:%M:%S"
+        df = df.with_columns(
+            pl.col("date").str.to_datetime("%Y-%m-%d %H:%M:%S")
+        )
+
+        # Now filter by year
+        df = df.filter(
+            (pl.col("date").dt.year() >= 2010) &
+            (pl.col("date").dt.year() <= 2015)
+        )
+
+        print(f"Data filtered! Remaining rows: {df.height}")
+        # ------------------------
         features_df = df.drop("date")
-        
+
         # We need raw prices to calculate actual dollar profit in the loop
         # Assuming 'close' is the 4th column (index 3) based on your image
         self.raw_prices = features_df.select("close").to_numpy().astype(np.float32).flatten()
-        
+
         raw_data = features_df.to_numpy().astype(np.float32)
-        
+
         # Normalize the data for the neural networks
         mean = np.mean(raw_data, axis=0)
         std = np.std(raw_data, axis=0)
         self.data = (raw_data - mean) / (std + 1e-8)
-        
+
     def __len__(self):
         # Stop 15 minutes before the end so we always have a "next_price"
         return len(self.data) - self.window_size - 1
 
     def __getitem__(self, idx):
         window = self.data[idx : idx + self.window_size].flatten()
-        
+
         # Get the actual un-normalized prices for the Arena's math
         current_price = self.raw_prices[idx + self.window_size - 1]
         next_price = self.raw_prices[idx + self.window_size]
-        
+
         return (
-            torch.tensor(window, dtype=torch.float32), 
-            current_price, 
+            torch.tensor(window, dtype=torch.float32),
+            current_price,
             next_price
         )
 
@@ -152,47 +175,61 @@ class SPYTradingDataset(Dataset):
 
 def train_firm(epochs=5, initial_capital=100000.0, fee_percent=0.0001):
     print("Loading Data...")
-    # Using the correctly spelled file name!
-    dataset = SPYTradingDataset("spy_1min_2008_2021_cleaned.parquet") 
+    dataset = SPYTradingDataset("spy_1min_2008_2021_cleaned.parquet")
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
-    
+
+    # Start with a 15% chance of random actions
+    epsilon = 0.15
+
     for epoch in range(epochs):
         print(f"\n--- Starting Epoch {epoch + 1} ---")
-        
+
+        # Decay epsilon every epoch so they use their brains more over time
+        current_epsilon = epsilon * (0.5 ** epoch)
+        print(f"Exploration Rate (Epsilon): {current_epsilon*100:.1f}%")
+
         portfolio_value = initial_capital
         peak_portfolio_value = initial_capital
         is_invested = 0  # 0 = Cash, 1 = Holding SPY
-        
+
         for step, (window, current_price, next_price) in enumerate(dataloader):
-            window = window.squeeze(0)
+            # Send the window to the GPU
+            window = window.squeeze(0).to(device)
             current_price = current_price.item()
             next_price = next_price.item()
-            
+
             # 1. Calculate Drawdown
             if portfolio_value > peak_portfolio_value:
                 peak_portfolio_value = portfolio_value
             drawdown = (peak_portfolio_value - portfolio_value) / peak_portfolio_value
-            
+
             # --------------------------------------------------
             # 2. FIRM THINKS (Forward Pass)
             # --------------------------------------------------
-            portfolio_state = torch.tensor([portfolio_value, drawdown], dtype=torch.float32)
-            position_tensor = torch.tensor([is_invested], dtype=torch.float32)
-            
+            portfolio_state = torch.tensor([portfolio_value, drawdown], dtype=torch.float32, device=device)
+            position_tensor = torch.tensor([is_invested], dtype=torch.float32, device=device)
+
             translated_data = translator(window)
             signal = evaluator(translated_data)
             action_probs = executor(signal, position_tensor)
-            action = torch.argmax(action_probs).item()
-            
-            # The Boss makes its prediction (using .detach() so the graph doesn't break!)
+
+            # --- THE NEW EXPLORATION LOGIC ---
+            if random.random() < current_epsilon:
+                # Take a completely random action (0=Buy, 1=Close, 2=Hold)
+                action = random.randint(0, 2)
+            else:
+                # Use the brain's best guess
+                action = torch.argmax(action_probs).item()
+
+            # The Boss makes its prediction
             expected_reward = boss(translated_data.detach(), signal.detach(), portfolio_state)
-            
+
             # --------------------------------------------------
             # 3. ARENA EXECUTES (Calculate Actual Reward)
             # --------------------------------------------------
             price_change = (next_price - current_price) / current_price
             actual_reward = 0.0
-            
+
             if is_invested == 0:
                 if action == 0:  # BUY
                     actual_reward = price_change - fee_percent
@@ -203,33 +240,44 @@ def train_firm(epochs=5, initial_capital=100000.0, fee_percent=0.0001):
                     actual_reward = -fee_percent
                     portfolio_value *= (1 + actual_reward)
                     is_invested = 0
-                else:  # HOLD 
+                else:  # HOLD
                     actual_reward = price_change
                     portfolio_value *= (1 + actual_reward)
-                    
+
             # --------------------------------------------------
             # 4. FIRM LEARNS (Backward Pass)
             # --------------------------------------------------
-            reward_tensor = torch.tensor([actual_reward], dtype=torch.float32)
-            
+            # Create the reward tensor on the GPU
+            reward_tensor = torch.tensor([actual_reward], dtype=torch.float32, device=device)
+
             # Boss calculates how wrong its prediction was
             advantage = reward_tensor - expected_reward.detach()
-            
+
             # Employees get rewired based on the advantage
             employee_loss = -torch.log(action_probs[action] + 1e-8) * advantage
             employee_optimizer.zero_grad()
             employee_loss.backward()
             employee_optimizer.step()
-            
+
             # Boss gets rewired based on how far off its prediction was from reality
             boss_loss = nn.MSELoss()(expected_reward, reward_tensor)
             boss_optimizer.zero_grad()
             boss_loss.backward()
             boss_optimizer.step()
-            
+
             # Print an update every 10,000 minutes
             if step % 10000 == 0:
                 print(f"Step {step}: Portfolio = ${portfolio_value:.2f} | Drawdown = {drawdown*100:.2f}% | Invested: {is_invested}")
+           # --- THIS GOES AT THE END OF THE EPOCH LOOP ---
+        print(f"Saving checkpoints for Epoch {epoch + 1} to Google Drive...")
+
+        # Save the brains (weights) of each bot
+        torch.save(translator.state_dict(), f"/content/drive/MyDrive/translator_epoch_{epoch+1}.pth")
+        torch.save(evaluator.state_dict(), f"/content/drive/MyDrive/evaluator_epoch_{epoch+1}.pth")
+        torch.save(executor.state_dict(), f"/content/drive/MyDrive/executor_epoch_{epoch+1}.pth")
+        torch.save(boss.state_dict(), f"/content/drive/MyDrive/boss_epoch_{epoch+1}.pth")
+
+        print("Save complete!")
 
 # Run the simulation!
 if __name__ == "__main__":
