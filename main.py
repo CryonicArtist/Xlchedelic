@@ -5,6 +5,7 @@ import polars as pl
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import random
+import os
 
 # Check if GPU is available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -173,112 +174,121 @@ class SPYTradingDataset(Dataset):
 # 4. THE TRAINING LOOP (THE ARENA)
 # ==========================================
 
-def train_firm(epochs=5, initial_capital=100000.0, fee_percent=0.0001):
+def train_firm(initial_capital=100000.0, fee_percent=0.0001):
+    # Set to the current local directory
+    save_dir = "./"
+    
+    # 1. Auto-detect the last completed epoch in your local folder
+    last_epoch = 0
+    while os.path.exists(f"{save_dir}boss_epoch_{last_epoch + 1}.pth"):
+        last_epoch += 1
+        
+    current_epoch = last_epoch + 1
+    print(f"\n--- Starting Training for Epoch {current_epoch} ---")
+    
+    # 2. Load previous brains if they exist
+    if last_epoch > 0:
+        print(f"Loading saved brains from Epoch {last_epoch}...")
+        translator.load_state_dict(torch.load(f"{save_dir}translator_epoch_{last_epoch}.pth"))
+        evaluator.load_state_dict(torch.load(f"{save_dir}evaluator_epoch_{last_epoch}.pth"))
+        executor.load_state_dict(torch.load(f"{save_dir}executor_epoch_{last_epoch}.pth"))
+        boss.load_state_dict(torch.load(f"{save_dir}boss_epoch_{last_epoch}.pth"))
+        print("Brains loaded successfully!")
+
     print("Loading Data...")
-    dataset = SPYTradingDataset("spy_1min_2008_2021_cleaned.parquet")
+    dataset = SPYTradingDataset("spy_1min_2008_2021_cleaned.parquet") 
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+    
+    # 3. Epsilon Math (Decays based on the current epoch)
+    base_epsilon = 0.15 
+    current_epsilon = base_epsilon * (0.5 ** (current_epoch - 1))
+    print(f"Exploration Rate (Epsilon): {current_epsilon*100:.1f}%")
+    
+    portfolio_value = initial_capital
+    peak_portfolio_value = initial_capital
+    is_invested = 0  # 0 = Cash, 1 = Holding SPY
+    
+    # THE 1-EPOCH LOOP
+    for step, (window, current_price, next_price) in enumerate(dataloader):
+        window = window.squeeze(0).to(device)
+        current_price = current_price.item()
+        next_price = next_price.item()
+        
+        # 1. Calculate Drawdown
+        if portfolio_value > peak_portfolio_value:
+            peak_portfolio_value = portfolio_value
+        drawdown = (peak_portfolio_value - portfolio_value) / peak_portfolio_value
+        
+        # --------------------------------------------------
+        # 2. FIRM THINKS (Forward Pass)
+        # --------------------------------------------------
+        portfolio_state = torch.tensor([portfolio_value, drawdown], dtype=torch.float32, device=device)
+        position_tensor = torch.tensor([is_invested], dtype=torch.float32, device=device)
+        
+        translated_data = translator(window)
+        signal = evaluator(translated_data)
+        action_probs = executor(signal, position_tensor)
+        
+        # --- THE EXPLORATION LOGIC ---
+        if random.random() < current_epsilon:
+            action = random.randint(0, 2)
+        else:
+            action = torch.argmax(action_probs).item()
+        
+        expected_reward = boss(translated_data.detach(), signal.detach(), portfolio_state)
+        
+        # --------------------------------------------------
+        # 3. ARENA EXECUTES (Calculate Actual Reward)
+        # --------------------------------------------------
+        price_change = (next_price - current_price) / current_price
+        actual_reward = 0.0
+        
+        if is_invested == 0:
+            if action == 0:  # BUY
+                actual_reward = price_change - fee_percent
+                portfolio_value *= (1 + actual_reward)
+                is_invested = 1
+        elif is_invested == 1:
+            if action == 1:  # CLOSE
+                actual_reward = -fee_percent
+                portfolio_value *= (1 + actual_reward)
+                is_invested = 0
+            else:  # HOLD 
+                actual_reward = price_change
+                portfolio_value *= (1 + actual_reward)
+                
+        # --------------------------------------------------
+        # 4. FIRM LEARNS (Backward Pass)
+        # --------------------------------------------------
+        reward_tensor = torch.tensor([actual_reward], dtype=torch.float32, device=device)
+        
+        advantage = reward_tensor - expected_reward.detach()
+        
+        employee_loss = -torch.log(action_probs[action] + 1e-8) * advantage
+        employee_optimizer.zero_grad()
+        employee_loss.backward()
+        employee_optimizer.step()
+        
+        boss_loss = nn.MSELoss()(expected_reward, reward_tensor)
+        boss_optimizer.zero_grad()
+        boss_loss.backward()
+        boss_optimizer.step()
+        
+        if step % 10000 == 0:
+            print(f"Step {step}: Portfolio = ${portfolio_value:.2f} | Drawdown = {drawdown*100:.2f}% | Invested: {is_invested}")
 
-    # Start with a 15% chance of random actions
-    epsilon = 0.15
+    # ======================================================
+    # SAVE CODE FOR THIS SINGLE EPOCH
+    # ======================================================
+    print(f"Saving checkpoints for Epoch {current_epoch} locally...")
+    
+    torch.save(translator.state_dict(), f"{save_dir}translator_epoch_{current_epoch}.pth")
+    torch.save(evaluator.state_dict(), f"{save_dir}evaluator_epoch_{current_epoch}.pth")
+    torch.save(executor.state_dict(), f"{save_dir}executor_epoch_{current_epoch}.pth")
+    torch.save(boss.state_dict(), f"{save_dir}boss_epoch_{current_epoch}.pth")
+    
+    print(f"Save complete for Epoch {current_epoch}! Run the script again to start the next one.")
 
-    for epoch in range(epochs):
-        print(f"\n--- Starting Epoch {epoch + 1} ---")
-
-        # Decay epsilon every epoch so they use their brains more over time
-        current_epsilon = epsilon * (0.5 ** epoch)
-        print(f"Exploration Rate (Epsilon): {current_epsilon*100:.1f}%")
-
-        portfolio_value = initial_capital
-        peak_portfolio_value = initial_capital
-        is_invested = 0  # 0 = Cash, 1 = Holding SPY
-
-        for step, (window, current_price, next_price) in enumerate(dataloader):
-            # Send the window to the GPU
-            window = window.squeeze(0).to(device)
-            current_price = current_price.item()
-            next_price = next_price.item()
-
-            # 1. Calculate Drawdown
-            if portfolio_value > peak_portfolio_value:
-                peak_portfolio_value = portfolio_value
-            drawdown = (peak_portfolio_value - portfolio_value) / peak_portfolio_value
-
-            # --------------------------------------------------
-            # 2. FIRM THINKS (Forward Pass)
-            # --------------------------------------------------
-            portfolio_state = torch.tensor([portfolio_value, drawdown], dtype=torch.float32, device=device)
-            position_tensor = torch.tensor([is_invested], dtype=torch.float32, device=device)
-
-            translated_data = translator(window)
-            signal = evaluator(translated_data)
-            action_probs = executor(signal, position_tensor)
-
-            # --- THE NEW EXPLORATION LOGIC ---
-            if random.random() < current_epsilon:
-                # Take a completely random action (0=Buy, 1=Close, 2=Hold)
-                action = random.randint(0, 2)
-            else:
-                # Use the brain's best guess
-                action = torch.argmax(action_probs).item()
-
-            # The Boss makes its prediction
-            expected_reward = boss(translated_data.detach(), signal.detach(), portfolio_state)
-
-            # --------------------------------------------------
-            # 3. ARENA EXECUTES (Calculate Actual Reward)
-            # --------------------------------------------------
-            price_change = (next_price - current_price) / current_price
-            actual_reward = 0.0
-
-            if is_invested == 0:
-                if action == 0:  # BUY
-                    actual_reward = price_change - fee_percent
-                    portfolio_value *= (1 + actual_reward)
-                    is_invested = 1
-            elif is_invested == 1:
-                if action == 1:  # CLOSE
-                    actual_reward = -fee_percent
-                    portfolio_value *= (1 + actual_reward)
-                    is_invested = 0
-                else:  # HOLD
-                    actual_reward = price_change
-                    portfolio_value *= (1 + actual_reward)
-
-            # --------------------------------------------------
-            # 4. FIRM LEARNS (Backward Pass)
-            # --------------------------------------------------
-            # Create the reward tensor on the GPU
-            reward_tensor = torch.tensor([actual_reward], dtype=torch.float32, device=device)
-
-            # Boss calculates how wrong its prediction was
-            advantage = reward_tensor - expected_reward.detach()
-
-            # Employees get rewired based on the advantage
-            employee_loss = -torch.log(action_probs[action] + 1e-8) * advantage
-            employee_optimizer.zero_grad()
-            employee_loss.backward()
-            employee_optimizer.step()
-
-            # Boss gets rewired based on how far off its prediction was from reality
-            boss_loss = nn.MSELoss()(expected_reward, reward_tensor)
-            boss_optimizer.zero_grad()
-            boss_loss.backward()
-            boss_optimizer.step()
-
-            # Print an update every 10,000 minutes
-            if step % 10000 == 0:
-                print(f"Step {step}: Portfolio = ${portfolio_value:.2f} | Drawdown = {drawdown*100:.2f}% | Invested: {is_invested}")
-           # --- THIS GOES AT THE END OF THE EPOCH LOOP ---
-        print(f"Saving checkpoints for Epoch {epoch + 1} to Google Drive...")
-
-        # Save the brains (weights) of each bot
-        torch.save(translator.state_dict(), f"/content/drive/MyDrive/translator_epoch_{epoch+1}.pth")
-        torch.save(evaluator.state_dict(), f"/content/drive/MyDrive/evaluator_epoch_{epoch+1}.pth")
-        torch.save(executor.state_dict(), f"/content/drive/MyDrive/executor_epoch_{epoch+1}.pth")
-        torch.save(boss.state_dict(), f"/content/drive/MyDrive/boss_epoch_{epoch+1}.pth")
-
-        print("Save complete!")
-
-# Run the simulation!
 if __name__ == "__main__":
     train_firm()
+
